@@ -27,22 +27,26 @@ import {
 
 const STALE_SESSION_STATE_MS = 7 * 24 * 60 * 60 * 1000
 
+// Every OpenCode process (and every manager in one process) writes its own
+// temp file, so two writers sharing the plugin root never rename each other's
+// file away (ENOENT); the rename onto the state file stays atomic.
+let tempSequence = 0
+
 export function createMemorySessionManager({ config, pluginRoot }) {
   const sessions = new Map()
   const statePath = path.join(pluginRoot, "openviking-session-state.json")
   const oldSessionMapPath = path.join(pluginRoot, "openviking-session-map.json")
   let saveTimer = null
   let initBackground = Promise.resolve()
-  // Serialize saves: concurrent saveState() calls (a debounced save racing
-  // with flushAll / flushSession / session deletion) all share the same
-  // `${statePath}.tmp` temp file, so one rename can fail with ENOENT after
-  // another already moved it. Chaining through a promise queue keeps at most
-  // one write+rename in flight. Each queued save re-serializes the in-memory
-  // `sessions` map at execution time, so the last save always persists the
-  // latest state.
+  // Serialize saves so at most one write+rename is in flight and the last
+  // rename always lands the latest state. Each queued save re-serializes the
+  // in-memory `sessions` map at execution time, so it supersedes any pending
+  // debounced save.
   let saveChain = Promise.resolve()
 
   function enqueueSave() {
+    if (saveTimer) clearTimeout(saveTimer)
+    saveTimer = null
     const run = saveChain.then(() => saveState())
     saveChain = run.catch(() => {})
     return run
@@ -104,7 +108,8 @@ export function createMemorySessionManager({ config, pluginRoot }) {
       for (const [opencodeSessionId, state] of sessions.entries()) {
         persisted[opencodeSessionId] = serializeSessionState(state)
       }
-      const tempPath = `${statePath}.tmp`
+      tempSequence += 1
+      const tempPath = `${statePath}.${process.pid}.${tempSequence}.tmp`
       await fs.promises.writeFile(tempPath, JSON.stringify({ version: 2, sessions: persisted, lastSaved: Date.now() }, null, 2), "utf8")
       await fs.promises.rename(tempPath, statePath)
       log("DEBUG", "persistence", "Session state saved", { count: sessions.size })
