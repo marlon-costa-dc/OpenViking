@@ -9,6 +9,10 @@ import { createMemorySessionManager } from "../lib/memory-session.mjs"
 import { contextMessageEvents } from "../lib/v2-events.mjs"
 import { initLogger } from "../lib/utils.mjs"
 
+// The plugin logger is module-global: once a test points it at a directory,
+// every later test logs there, so that directory must outlive the tests.
+const suiteLogDir = await mkdtemp(join(tmpdir(), "ov-oc-log-"))
+
 async function withTempDir(prefix, fn) {
   const dir = await mkdtemp(join(tmpdir(), prefix))
   try {
@@ -781,6 +785,46 @@ test("concurrent saves never race the shared state file (#3877)", async (t) => {
   })
 })
 
+test("two plugin instances sharing the plugin root never race the state file", async (t) => {
+  // Two OpenCode processes load the plugin with the same plugin root; each
+  // serializes its own saves, but they write at the same time. A slow rename
+  // lets one instance move a shared temp file before the other renames it.
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const origWriteFile = fs.promises.writeFile
+  const origRename = fs.promises.rename
+  let raceDetected = false
+
+  t.mock.method(fs.promises, "writeFile", async (...args) => {
+    await delay(20)
+    return origWriteFile.call(fs.promises, ...args)
+  })
+  t.mock.method(fs.promises, "rename", async (from, to) => {
+    await delay(5)
+    if (!fs.existsSync(from)) {
+      raceDetected = true
+      const err = new Error(`ENOENT: no such file or directory, rename '${from}' -> '${to}'`)
+      err.code = "ENOENT"
+      throw err
+    }
+    return origRename.call(fs.promises, from, to)
+  })
+
+  await withTempDir("ov-oc-session-", async (dir) => {
+    const config = { ...baseConfig("http://127.0.0.1:1"), autoCapture: false }
+    const first = createMemorySessionManager({ config, pluginRoot: dir })
+    const second = createMemorySessionManager({ config, pluginRoot: dir })
+
+    await first.handleEvent({ type: "session.created", properties: { info: { id: "first-a" } } })
+    await second.handleEvent({ type: "session.created", properties: { info: { id: "second-a" } } })
+
+    await Promise.all([first.flushAll(), second.flushAll(), first.flushAll(), second.flushAll()])
+
+    assert.equal(raceDetected, false)
+    const leftovers = (await fs.promises.readdir(dir)).filter((name) => name.endsWith(".tmp"))
+    assert.deepEqual(leftovers, [])
+  })
+})
+
 test("explicit commit writes the response trace_id to the plugin log", async () => {
   const requests = []
   const server = createServer(async (req, res) => {
@@ -802,7 +846,7 @@ test("explicit commit writes the response trace_id to the plugin log", async () 
   try {
     await withTempDir("ov-oc-session-trace-", async (dir) => {
       const { port } = server.address()
-      initLogger(dir)
+      initLogger(suiteLogDir)
       const manager = createMemorySessionManager({
         config: { ...baseConfig(`http://127.0.0.1:${port}`), autoCapture: false },
         pluginRoot: dir,
@@ -812,7 +856,7 @@ test("explicit commit writes the response trace_id to the plugin log", async () 
       assert.equal(result.traceId, "trace-opencode-commit")
       assert.equal(requests[0].url, "/api/v1/sessions/oc-explicit-trace/commit")
       assert.deepEqual(JSON.parse(requests[0].body), { keep_recent_count: 0 })
-      const raw = await fs.promises.readFile(join(dir, "openviking-memory.log"), "utf8")
+      const raw = await fs.promises.readFile(join(suiteLogDir, "openviking-memory.log"), "utf8")
       assert.match(raw, /"trace_id":"trace-opencode-commit"/)
     })
   } finally {
